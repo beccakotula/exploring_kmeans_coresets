@@ -1,0 +1,698 @@
+---
+title: |
+  <center> Exploring the Power of Coresets for K-Means Clustering</center>
+subtitle: |
+    | Johns Hopkins University  
+    | EN.625.740 Data Mining
+header-includes:
+    - \usepackage{setspace}\onehalfspacing
+    - \usepackage{indentfirst}
+    - \usepackage{amsmath}
+    - \usepackage{booktabs}
+author: "Rebecca Kotula"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+bibliography: references.bib
+geometry: margin=3cm
+classoption: 12pt
+output: pdf_document
+indent: true
+---
+```{r global_options, R.options=knitr::opts_chunk$set(warning=FALSE, message=FALSE)}
+```
+```{r setup_imports, include=FALSE}
+library(ggplot2)
+library(GGally)
+library(ggpubr)
+library(Rtsne)
+library(kableExtra)
+library(MASS) 
+library(tidyverse)
+library(Rfast)
+
+library(reticulate)
+use_virtualenv("/Users/rebeccakotula/Documents/jhu/datamining/dm")
+np <- import("numpy")
+coresets <- import("coresets")
+
+seed <- 1234
+
+data(iris)
+
+### K-means helper functions 
+predict.kmeans <- function(km.object, newdata){
+    centers <- km.object$centers
+    n.centers <- nrow(centers)
+    dist.mat <- as.matrix(dist(rbind(centers, newdata)))
+    dist.mat <- dist.mat[-seq(n.centers), seq(n.centers)]
+    max.col(-dist.mat)
+}
+
+euclidean.dist <- function(a, b){
+    sqrt(sum((a - b)^2))
+}
+
+kmeans.tot.withinss <- function(km.object, data){
+    centers <- km.object$centers
+    dist.mat <- data.frame(matrix(NA, nrow = nrow(data), ncol = nrow(centers)))
+    for (i in 1:nrow(centers)){
+        dist.mat[,i] <- apply(data, 1, function(x) euclidean.dist(x,centers[i,])) 
+    }
+    dists <- apply(dist.mat, 1, function(x) min(x))
+    sum(dists^2)
+}
+
+relabel.clusters <- function(km.object, data.x, data.y, preds){
+    centers <- km.object$centers
+    n.centers <- nrow(centers)
+    dist.mat <- as.matrix(dist(rbind(centers, data.x)))
+    dist.mat <- dist.mat[-seq(n.centers), seq(n.centers)]
+    min.idxs <- as.integer(colMins(dist.mat)) #rownames(dist.mat)[colMins(dist.mat)]
+    clusts <- seq(1, n.centers, by=1)
+    labels <- data.y[min.idxs]
+    
+    preds <- as.data.frame(preds)
+    for (i in 1:n.centers){
+        preds <- data.frame(preds)
+        preds[preds$preds==i,] <- paste0(labels[i])
+    }
+    return(preds)
+}
+```
+
+\newpage
+# Introduction 
+
+Despite the term "coreset" being coined in 2005, the study and application of coresets seems to be discussed surprisingly little in data science and machine learning circles (@Feldman). This is perhaps because there is not simply one way to define a coreset, as there are different kinds, and thus there is not simply one algorithm to generate a coreset. In general, a coreset of a dataset is some smaller, weighted dataset which yields comparable accuracy when applying the same methods to the coreset as to the original dataset. A coreset is selected and built in such a way that it maintains the necessary characteristics of the original dataset that are relevant to the task at hand. Thus, with negligible change in accuracy, the target task can be performed by training or modeling solely on the coreset instead of the entire large datset. 
+
+Coresets were originally studied in the context of the field of computational geometry, but the approaches available at that time were based on computationally expensive methods such as exponential grids (@Bachem). Today, many more methods have been presented for selecting a coreset given an input dataset and a cost function we seek to minimize. Finding a coreset has many obvious benefits- most significantly that it can greatly speed up computational cost and time, which is valuable in a variety of scenarios. As "big data" gets larger and larger, methods to improve computational and memory efficiency are not only helpful, they are necessary. For this reason, coresets are also particularly useful in streaming applications, since they involve large amounts of data continuously incoming. Once an accurate and strong coreset has been obtained, streaming data can be easily filtered to determine whether a coreset is updated or not. 
+
+Intuitively, coresets make sense. It seems probable that a very large dataset would in fact have some smaller subset that captures the important qualities of the full dataset. However, what seems perhaps less likely is that this same effect could be achieved when starting with a much smaller dataset. Larger datasets can often contain more noise, repetition, and variance in general, just due to their large nature, than small datasets. This begs the question of whether training on coresets of small datasets incurs a higher cost in accuracy than when training on coresets of large datasets. We will explore exactly this question in the following pages.
+
+# Project Description 
+
+The goal of this project is to explore the effectiveness of coresets on both large and small scale datasets. To do this, we select two datasets, compute coresets (optimized for k-means clustering), and apply k-means clustering to both the original datasets as well as their coresets. We will compare the results both between original datasets and their corresponding coreset, as well as between these two datasets of different sizes. We also explore the relationship between the size of a coreset and the maintained accuracy on the chosen task.    
+
+In this paper, we will first provide background information by introducing the basic definition and methodology for constructing a coreset, describing the k-means clustering algorithm, explaining how coresets are constructed for k-means specifically, and finally presenting the datasets used in this project. We will then describe our methods, including steps taken to prepare the data, constructing the actual coresets, and applying the k-means clustering algorithm. Finally, we will present our results, followed by some discussion. 
+
+# Background
+## K-Means Clustering 
+
+Before we discuss coresets, we will give a simple introduction of the intended function that we'd like to optimize using coresets. In a $k$-means clustering problem, given a dataset $\mathcal{X}$, we seek to compute a set of $k$ centers. Let us call this set of centers $Q$, with $|Q|=k$. The selected centers are chosen to optimize 
+$$cost(\mathcal{X}, Q) =\sum_{x\in \mathcal{X}} \min_{q\in Q} \lVert x-q\rVert_2^2, $$
+
+the sum of squared distances. $k$-means is an iterative problem. First, cluster centers are randomly initialized, given a set value of $k$. Points are then assigned to clusters according to which cluster center they are closest to. Then, new cluster centers are computed by taking the mean of all the datapoints in each cluster. Points are then re-assigned using the new cluster centers, and these steps are repeated until convergence. 
+
+## Coresets
+
+Coresets are small, potentially weighted summaries of an dataset that provably compete with the accuracy achieved on a specific problem using the larger dataset. By nature, coresets problem-specific because they require a cost function associated with the problem we are trying to solve. If we think about the problem as an optimization problem, as so many problems in machine learning are, we need to construct a coreset that optimizes a specific objective. Thus, a given dataset does not have a singular coreset- the coreset must be computed with a specific problem in mind. 
+
+In our explanation, we will assume that the target problem is $k$-means because that is what is used in this paper, however, keep in mind that coresets can be constructed for many types of problems. Now, given a dataset $\mathcal{X}$ and a solution space of all possible solutions, $\mathcal{Q}$, we seek to optimize a cost function, $cost(\mathcal{X}, Q)$ by finding the optimal solution, $Q$. For $k$-means clustering, we want to find a number of clusters $k$, which minimizes: 
+$$cost(\mathcal{X}, Q) = \sum_{x\in \mathcal{X}} \mu_{\mathcal{X}}(x)f_{Q}(x) = \sum_{x\in \mathcal{X}} \mu_{\mathcal{X}}(x) \min_{q\in Q} \lVert x-q\rVert_2^2$$
+where $f_{Q}(x) =\min_{q\in Q} \lVert x-q\rVert_2^2$ is the squared distance from each point $x\in \mathcal{X}$ to the closest cluster center in $Q$. 
+
+Now, with $\epsilon> 0$, we can formally define a coreset as an $\epsilon-coreset$ of $\mathcal{X}$ if for all $Q\in\mathcal{Q}$:
+$$\lvert cost(\mathcal{X}, Q) - cost(\mathcal{C}, Q)\rvert \leq \epsilon cost(\mathcal{X}, Q)$$
+If this holds for all possible solutions $Q\subset \mathcal{Q}$, then $\mathcal{C}$ is a *strong coreset*. If it only holds for the optimal solution, then it is a *weak coreset*. 
+
+There are many approaches to constructing a coreset. There are naive approaches, such as uniform sampling, but methods such using importance sampling achieve greater results with smaller coresets. In importance sampling, points are sampled proportionate to their impact on the cost of any given candidate solution. Points are weighted accordingly, and points with low optimum cost are sampled uniformly. Related to importance sampling is sensivity-based sampling. The sensitivity for a point is defined as
+$$ sens(x) = sup_Q \frac{\min_{q\in Q} \lVert x-q\rVert_2^2}{cost_{\mathcal{X}}(Q)}$$
+Intuitively, the sensitivity of a point is the maximum share of a point in the cost function. Ideally, a distribution is sampled proportionate to the sensitivity for a point, weighted by their inverse sampling probability. 
+
+These are just a few of the many approaches to coreset construction. For example, a very different approach is bounded point movement. Points are moved within specific bounds, and close-together points will be merged and weighted accordingly. However, this project uses an implementation based on the sensitivity framework with importance sampling described by @Bachem. 
+
+
+## Datasets
+
+We explore two datasets in this project. The first is a small dataset, used to demonstrate the coreset selection process, and to prove the results on a simple case. By using this dataset we also seek to determine how effective coresets are on small datasets. The second dataset is much larger, however, due to computational size constraints, it does not approach the size of "big data" for which coresets really have serious cost-saving implications. Nonetheless, it serves to compare the results between two datasets of varying sizes.
+
+Our small dataset is the commonly-used @Fisher Iris dataset. This dataset has `r nrow(iris)` observations of 4 features: `Sepal.Length`, `Sepal.Width`, `Petal.Length`, and `Petal.Width`. There are three class labels: `Setosa`, `Versicolor`, and `Virginica`. The anticipated task for this dataset is to classify the species of Iris flower based on its measurements. More specifics, including plots, will presented in the *Methods: Data Preparation* section. 
+
+The class distribution in the Iris dataset is: 
+
+```{r iris-class-dist, echo=FALSE}
+table(iris$Species) %>% 
+    kbl() %>%
+    kable_paper(full_width = F)%>%
+  kable_styling(latex_options="HOLD_position")
+```
+
+Based on this, we can anticipate three balanced clusters that we wish to predict in our dataset. We have selected a dataset with class labels in order to simplify the problem space to a scope that can be covered in this paper. In other situations it would be interesting to perform further experiments regarding selecting optimal numbers of clusters; in this paper, we will assume the correct number of (known) clusters has already been selected so that we can address other aspects of the problem. 
+
+```{r, include=FALSE}
+# set seed and create data vectors 
+set.seed(seed) 
+sample.size <- 4000   
+```
+
+The larger dataset is a simulated five-dimensional multivariate Gaussian with four distinct classes. Other non-simulated datasets were explored, including an Online Shoppers Purchasing Intention Dataset and a Bank Marketing Dataset from the UCI Machine Learning Repository, but these datasets did not have the attributes necesssary to showcase the features of a K-means coreset that we wish to explore in this paper. We chose to create a simulated data set in order to have a known number of classes, to have a problem that $k$-means clustering can achieve reasonable success on, and to be able to better visualize the dataset and results. This dataset was generated using the following parameters, with additional Gaussian noise added. Full reproducible dataset construction code can be found at the reference located in the *Appendix*. 
+
+```{r simulated-data}
+class1.mu <- c(10, 5, 7, 9, 20)   
+class2.mu <- c(9, 3, 4, 5, 15)   
+class3.mu <- c(3, 2, 1, 4, 9)   
+class4.mu <- c(5, 5, 5, 5, 5)   
+
+n <- 5 
+A1 <- matrix(runif(n^2)*2-1, ncol=n) 
+sigma1 <- t(A1) %*% A1
+A2 <- matrix(runif(n^2)*4-2, ncol=n) 
+sigma2 <- t(A2) %*% A2
+A3 <- matrix(runif(n^2)*3-2, ncol=n) 
+sigma3 <- t(A3) %*% A3
+A4 <- matrix(runif(n^2)*2-2, ncol=n) 
+sigma4 <- t(A4) %*% A4
+```
+
+```{r gen-sim-data, include=FALSE}  
+# create multivariate normal distribution 
+class1.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class1.mu,  
+                               Sigma = sigma1))
+class2.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class2.mu,  
+                               Sigma = sigma2)) 
+class3.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class3.mu,  
+                               Sigma = sigma3))
+class4.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class4.mu,  
+                               Sigma = sigma4))
+
+class1.dat$class <- "a"
+class2.dat$class <- "b"
+class3.dat$class <- "c"
+class4.dat$class <- "d"
+
+sim.data <- rbind(class1.dat,rbind(class2.dat,rbind(class3.dat, class4.dat)))
+sim.mat <- as.matrix(sim.data[,-6]) 
+
+# Add Gaussian Noise 
+sim.sd <- apply(sim.mat, 1, sd)
+sim.dat <- sim.mat + rnorm(length(sim.mat), mean = 0, sd = sim.sd * 0.05)
+sim.data[,1:5] <- sim.dat
+```
+
+There are `r nrow(sim.data)` in this dataset and the class distribution is: 
+
+```{r dist-sim-data, echo=FALSE}
+table(sim.data$c) %>% 
+    kbl() %>%
+    kable_paper(full_width = F)%>%
+  kable_styling(latex_options="HOLD_position")
+```
+
+Both of the chosen datasets have the benefit of even class distribution. This also helps to narrow the problem space, allowing us to focus more closely on our desired aspects. Once again, more specifics and visualizations for this simulated datset will be presented in the *Methods: Data Preparation* section. 
+
+## t-SNE
+
+We will use t-SNE, or t-distributed Stochastic Neighbor Embedding, to visualize our five-dimensional simulated dataset. We present a quick overview of the algorithm here and note some limitations that will affect what we are and are not able to visualize later in this paper. 
+
+This method was presented by @Maaten. It is a technique to visualize high-dimensional data by assigning each datapoint a location on a two or three-dimensional map. It does well both with capturing local relationships of the data and with showing the global structure, such as presence of clusters, which is relevant for our use case. Although the two dimensional maps are created with kowledge of the relationships between the data, it is important to remember that higher-dimensional data cannot be perfectly replicated in a lower-dimensional space. It helps us to visualize our problem, but it is not a perfect representation, and we may not be able to distinguish clusters and patterns that exist in the higher dimensional space. 
+
+Another limitation is that once an embedding is computed on a dataset, new points cannot be added to it. It requires either re-computation of the whole dataset, or an additionally trained regression model that is trained on approximating the embedding of the data. In this paper, we will use a few workarounds to visualize our coreset, but this limitation will still come into play. 
+
+
+# Methods
+## Data Preparation
+
+To prepare the Iris dataset, we selected two of the four features to use for clustering in order to have an ideal 2-dimensional visualization for this more basic test case. By visual inspection, the features `Petal.Length` and `Petal.Width` seemed to provide the best class separation into clusters, so we chose these two to perform our analysis on. Additionally, these clusters seemed to be well-formed, so no further pre-processing (such as dealing with outliers) was performed. 
+
+```{r, message=FALSE,echo=FALSE, fig.width=8,fig.height=5}
+ggpairs(iris,title = "Iris Dataset Features",  columns=1:4, ggplot2::aes(colour = Species))+ theme_minimal()
+```
+
+```{r, include=FALSE, message=FALSE}
+train.size <- floor(0.75 * nrow(iris))
+set.seed(seed)
+train.ind <- sample(seq_len(nrow(iris)), size = train.size)
+
+train.iris <- iris[train.ind, ]
+test.iris <- iris[-train.ind, ]
+```
+
+The data was split into training and testing sets with a 75/25 split. The training dataset has `r nrow(train.iris)` observations and the testing dataset has `r nrow(test.iris)` observations. Thus, the final selection of the training set can be seen below. 
+\newline
+ 
+```{r, echo=FALSE,fig.height=4}
+g <- ggplot(train.iris, aes(x=Petal.Length, y = Petal.Width, col=Species)) + 
+    geom_point() + 
+    theme_minimal() +
+    ggtitle("Iris Training Dataset with True Class Labels")
+g
+```
+
+```{r, include=FALSE, message=FALSE}
+train.size.sim <- floor(0.75 * nrow(sim.data))
+set.seed(seed)
+train.ind.sim <- sample(seq_len(nrow(sim.data)), size = train.size.sim)
+
+train.sim <- sim.data[train.ind.sim, ]
+test.sim <- sim.data[-train.ind.sim, ]
+
+set.seed(seed)
+train.sim.mat <- as.matrix(train.sim[,-6])
+tsne.sim.out <- Rtsne(train.sim.mat, check_duplicates = FALSE)
+```
+
+Now we can take a look at our simulated dataset. This data was also split into training and testing sets with a 70/30 split. The training dataset has `r nrow(train.sim)` observations and the testing dataset has `r nrow(test.sim)` observations. 
+\newline
+
+```{r, echo=FALSE, fig.width=8,fig.height=5}
+tsne.sim.plot <- data.frame(x = tsne.sim.out$Y[,1],
+                        y = tsne.sim.out$Y[,2])
+g.sim.tsne <- ggplot(tsne.sim.plot) +
+    geom_point(aes(x=x, y=y, col = as.factor(train.sim[,6]))) +
+    theme_minimal() +
+    labs(color='class') +
+    ggtitle("t-SNE Representation of Simulated Training Dataset")
+g.sim.tsne
+```
+
+
+## Coreset Construction
+
+```{r, include=FALSE, message=FALSE}
+py_set_seed(seed, disable_hash_randomization = TRUE)
+X <- as.matrix(train.iris[,c("Petal.Length", "Petal.Width")])
+cs <- coresets$KMeansCoreset(X)
+coreset_gen <- cs$generate_coreset(as.integer(nrow(X)*0.1))
+
+train.iris.coreset <- data.frame(coreset_gen[[1]])
+train.iris.coreset.weights <- coreset_gen[[2]]
+colnames(train.iris.coreset) <- c("Petal.Length", "Petal.Width")
+```
+
+Coresets were constructed using the `coresets` package available for Python on PyPI. This implementation is based on the papers by @Bachem, @BachemKM, @Lucic, and @Borsos. As mentioned in the background information, this implementation uses point sensitivity and importance sampling. For the Iris dataset, we report our main results on a coreset that is 10 percent of the size of the original dataset. Across coreset literature, it is common to use coreset of just one percent for large datasets. However, because the Iris dataset is so small, 10 percent is only `r nrow(train.iris.coreset)` datapoints. We chose 10 percent to demonstrate the power of the coreset selection without making the coreset absurdly small. Below we can see a depiction of the coreset selected for the Iris training dataset. 
+\newline
+
+```{r iris-coreset-plot, echo=FALSE,fig.height=3}
+c <- ggplot() + geom_point(data=train.iris, aes(x=Petal.Length, y = Petal.Width)) + 
+    geom_point(data=cbind(train.iris.coreset,train.iris.coreset.weights), aes(x=Petal.Length,y=Petal.Width, size=train.iris.coreset.weights), alpha=0.6,col='red')+
+    theme_minimal() + 
+    ggtitle("Iris Training Dataset with Coreset in Red")
+c
+```
+
+The weights here correspond to the importance of each point in the coreset. This generally can be interpreted as the amount of other points that each coreset point is "incorporating". 
+
+```{r sim-coreset, include = FALSE}
+# Generate Coreset
+py_set_seed(seed, disable_hash_randomization = TRUE)
+X.sim <- as.matrix(train.sim[,-6])
+cs.sim <- coresets$KMeansCoreset(X.sim, n_clusters = as.integer(4), random_state = as.integer(1234))
+coreset_gen.sim <- cs.sim$generate_coreset(as.integer(length(X.sim)*0.01))
+
+train.sim.coreset <- data.frame(coreset_gen.sim[[1]])
+train.sim.coreset.weights <- coreset_gen.sim[[2]]
+
+# Which indices from original dataset are in the coreset: 
+train.sim.list <- paste(train.sim[,1], train.sim[,2], train.sim[,3], train.sim[,4], train.sim[,5])
+train.sim.coreset.list <- paste(train.sim.coreset[,1], train.sim.coreset[,2], train.sim.coreset[,3], train.sim.coreset[,4], train.sim.coreset[,5])
+coreset.ind <- which(train.sim.list %in% train.sim.coreset.list)
+```
+
+For our larger simulated dataset, we will report results using a coreset of one percent. This coreset has `r nrow(train.sim.coreset)` observations. 
+\newline
+
+```{r, echo=FALSE, fig.width=8,fig.height=5}
+c.sim <- ggplot() + 
+    geom_point(data=tsne.sim.plot, aes(x=x, y=y), alpha=0.6) + 
+    geom_point(data=tsne.sim.plot[coreset.ind,], aes(x=x,y=y), col='red')+ 
+    theme_minimal() + 
+    ggtitle("Simulated Training Dataset with Coreset in Red")
+c.sim
+```
+
+Here is where some of the difficulties of t-SNE come in; the coreset was mapped back to the original dataset's projections into the embedding space as well as possible, but it is not a complete representation. However, this visual still helps to give an idea of what the coreset looks like and the amount of data that it covers. 
+
+## Coreset Size Sweep
+
+In addition to reporting the detailed results of typical-sized coresets for each of our datasets, we perform a sweep over multiple coreset sizes in order to compare the resulting metrics. This table shows the selected coreset sizes (as proportions of the full-sized datasets) used and the resulting number of observations in the coreset for each of our datasets. 
+
+```{r coreset-sizes, echo=FALSE}
+sizes <- c(0.01, 0.04, 0.05, 0.1, 0.25)
+iris.sizes <- as.integer(nrow(train.iris)*sizes)
+sim.sizes <- as.integer(nrow(train.sim)*sizes)
+size.table <- data.frame(size = sizes, 
+                         train.iris = iris.sizes, 
+                         train.sim = sim.sizes
+                         )
+size.table <- rbind(size.table, c("original", nrow(train.iris), nrow(train.sim)))
+size.table %>% 
+    kbl() %>%
+    kable_paper(full_width = F)%>%
+  kable_styling(latex_options="HOLD_position")
+```
+
+These sizes are computed from the 70% training splits of each of the datasets. We will skip the implementation of 1% on the Iris dataset, because you cannot perform clustering with three clusters on one datapoint. 
+
+## Clustering
+
+Clustering was performed using the `kmeans` implementation from the `stats` package in R. All clusterings use 25 random initial configurations and report the best one. A custom function was written to assign new data to clusters based on the determined centroids. Code can be found at the indicated location in the *Appendix*. 
+
+## Evaluation Metrics
+
+We evaluate based on two main metrics. Because we have selected datasets in which the class labels are known, we can compute accuracy (as well as confusion matrices) based on the predicted cluster assignments. The other metric we report is the $k$-means total within-cluster sum of squares. We use the predicted centroids from each model (whether trained on a coreset or full training set) to compute the within-cluster sum of squares on the entire dataset. This gives more insight into how well the $k$-means centroids fit the dataset as a whole. 
+
+# Results
+## Clustering on Original Dataset vs. Coreset
+
+First we will look at the results on the Iris dataset. The $k$-means clustering assignments on the full training dataset are very accurate. 
+\newline
+
+```{r, include=FALSE}
+set.seed(seed)
+km <- kmeans(train.iris[,c("Petal.Length", "Petal.Width")], 3, nstart = 25)
+
+preds <- km$cluster
+preds <- relabel.clusters(km, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          preds)
+
+k <- ggplot(cbind(train.iris, preds), aes(x=Petal.Length, y = Petal.Width, col=preds)) + 
+    geom_point()+ 
+    theme_minimal() + 
+    ggtitle("K-Means: Iris Training Set") +
+    labs(color='Predicted Species') + 
+    theme(legend.position = "none")
+
+set.seed(seed)
+km.c <- kmeans(train.iris.coreset[,1:2], 3, nstart = 25)
+preds.c <- km.c$cluster
+preds.c <- relabel.clusters(km.c, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          preds.c)
+
+train.iris.coreset["Species.Pred"] <- preds.c
+
+k.c <- ggplot(train.iris.coreset, aes(col=Species.Pred)) +
+    geom_point(aes(x=Petal.Length,y=Petal.Width))+ 
+    theme_minimal() + 
+    labs(color='Predicted Species') +
+    ggtitle("K-Means: Iris Coreset")
+
+c <- ggplot() + geom_point(data=iris, aes(x=Petal.Length, y = Petal.Width, col=Species)) + 
+    geom_point(aes(x=km$centers[,1],y=km$centers[,2]), col='blue', shape=15, size=3)+
+    geom_point(aes(x=km.c$centers[,1],y=km.c$centers[,2]), col='red', shape=15, size=3)+ 
+    theme_minimal() +
+    ggtitle("K-means Centers on Full Iris Dataset (True Labels)") 
+```
+
+```{r, echo=FALSE, fig.height=4}
+ggarrange(k, k.c, ncol=2, common.legend = TRUE, legend="bottom")
+```
+
+```{r iris-test-accuracy, include=FALSE}
+set.seed(seed)
+test.preds <- predict.kmeans(km, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds <- relabel.clusters(km, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          test.preds)
+
+acc.test <- sum(test.preds$preds==test.iris$Species)/nrow(test.iris)
+
+set.seed(seed)
+test.preds.c <- predict.kmeans(km.c, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.c <- relabel.clusters(km.c, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          test.preds.c)
+
+acc.test.c <- sum(test.preds.c$preds==test.iris$Species)/nrow(test.iris)
+
+acc <- c(acc.test, acc.test.c)
+ss <- c(kmeans.tot.withinss(km,iris[,3:4]), kmeans.tot.withinss(km.c,iris[,3:4]))
+train.set <- c("full Iris", "10% Iris coreset")
+```
+
+```{r, echo=FALSE}
+data.frame(train.set =train.set, test.accuracy = acc, tot.within.ss = ss) %>% 
+    kbl() %>%
+    kable_paper(full_width = F)%>%
+    kable_styling(latex_options="HOLD_position")
+```
+
+We've achieved identical accuracies on the test set, with only a slightly higher total within-cluster sum of squares on the entire dataset using the coreset as the training set. Now we will look more closely at the confusion matrices to see which points are misclassified in the test set.
+
+```{r, echo=FALSE,results="asis"}
+t1 <- kable(table(test.preds$preds, test.iris$Species), format="latex", booktabs=TRUE)
+t2 <- kable(table(test.preds.c$preds, test.iris$Species), format="latex", booktabs=TRUE)
+
+cat(c("\\begin{table}[!htb]
+    \\begin{minipage}{.5\\linewidth}
+      \\caption{Full training set}
+      \\centering",
+        t1,
+    "\\end{minipage}%
+    \\begin{minipage}{.5\\linewidth}
+      \\centering
+        \\caption{Coreset}",
+        t2,
+    "\\end{minipage} 
+\\end{table}"
+))  
+```
+
+Our results are extremely similar, and we see there are a few misclassifications between `versicolor` and `virginica`, which we'd expect, since those clusters overlap slightly. 
+
+In the plot below, we can see the actual location of the centers predicted by $k$-means on the full Iris datset with the true labels. The blue squares are the centers predicted by training on the full dataset, and the red are predicted by training on the coreset. Note that they are quite close, indicating once again that we've achieved a similar fit using just the coreset. 
+\newline
+
+```{r, echo=FALSE, fig.height=3}
+c
+```
+
+Next, let us compare the results on the simulated dataset. We are not able to map these results accurately to the t-SNE embedding, so we will compare metrics without the visualization. 
+
+```{r, echo=FALSE, fig.height=4}
+set.seed(seed)
+km.sim<- kmeans(train.sim[,-6], 4, nstart = 25)
+preds.sim <- km.sim$cluster
+preds.sim <- relabel.clusters(km.sim, train.sim[,-6], train.sim[,6], preds.sim)
+
+set.seed(seed)
+km.c.sim <- kmeans(train.sim.coreset, 4, nstart = 25)
+preds.c.sim <- km.c.sim$cluster
+preds.c.sim <- relabel.clusters(km.c.sim, 
+                                train.sim[,-6], 
+                                train.sim[,6], 
+                                preds.c.sim)
+```
+
+```{r, echo=FALSE}
+set.seed(seed)
+test.sim.preds <- predict.kmeans(km.sim, test.sim[,-6])
+test.sim.preds <- relabel.clusters(km.sim, 
+                                   train.sim[,-6], 
+                                   train.sim[,6], 
+                                   test.sim.preds)
+
+acc.test.sim <- sum(test.sim.preds$preds==test.sim[,6])/nrow(test.sim)
+
+set.seed(seed)
+test.sim.c.preds <- predict.kmeans(km.c.sim, test.sim[,-6])
+test.sim.c.preds <- relabel.clusters(km.c.sim, 
+                                   train.sim[,-6], 
+                                   train.sim[,6], 
+                                   test.sim.c.preds)
+
+acc.test.c.sim <- sum(test.sim.c.preds$preds==test.sim[,6])/nrow(test.sim)
+
+
+acc.sim <- c(acc.test.sim, acc.test.c.sim)
+ss.sim <- c(kmeans.tot.withinss(km.sim, sim.data[,-6]), kmeans.tot.withinss(km.c.sim, sim.data[,-6]))
+train.set.sim <- c("full sim", "1% sim coreset")
+```
+
+```{r, echo=FALSE}
+data.frame(train.set =train.set.sim, test.accuracy = acc.sim, tot.within.ss = ss.sim) %>% 
+    kbl() %>%
+    kable_paper(full_width = F)%>%
+    kable_styling(latex_options="HOLD_position")
+```
+
+The clustering accuracy is not quite as good on this dataset as what we achieved on the Iris dataset, but we achieve nearly equivalent accuracy using only 1% of the original testing set. The total within-cluster sum of squares is still quite close as well. Now let us look more closely at the confusion matrices. 
+
+```{r, echo=FALSE,results="asis"}
+t1 <- kable(table(test.sim.preds$preds, test.sim[,6]), format="latex", booktabs=TRUE)
+t2 <- kable(table(test.sim.c.preds$preds, test.sim[,6]), format="latex", booktabs=TRUE)
+
+cat(c("\\begin{table}[!htb]
+    \\begin{minipage}{.5\\linewidth}
+      \\caption{Full training set}
+      \\centering",
+        t1,
+    "\\end{minipage}%
+    \\begin{minipage}{.5\\linewidth}
+      \\centering
+        \\caption{Coreset}",
+        t2,
+    "\\end{minipage} 
+\\end{table}"
+))  
+```
+
+Again, the results from the coreset model are quite impressive and closely the results from the original model. There is some misclassification mostly involving class `c`, which we would expect based on the t-SNE visualization of the training dataset. Class `c` appears to include more noisy datapoints that cross over into other clusters. 
+
+## Effect of Coreset Sizes on Clustering
+
+We now analyze the results of different sized coresets of both of our datasets, as described in the *Coreset Size Sweep* section.  
+
+```{r, include=FALSE}
+sizes <- c(0.01,0.04, 0.05, 0.1, 0.25)
+py_set_seed(seed, disable_hash_randomization = TRUE)
+coreset.04 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.04)))[[1]])
+coreset.05 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.05)))[[1]])
+coreset.1 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.1)))[[1]])
+coreset.25 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.25)))[[1]])
+
+colnames(coreset.04) <- c("Petal.Length", "Petal.Width")
+colnames(coreset.05) <- c("Petal.Length", "Petal.Width")
+colnames(coreset.1) <- c("Petal.Length", "Petal.Width")
+colnames(coreset.25) <- c("Petal.Length", "Petal.Width")
+
+set.seed(seed)
+km.c.04<- kmeans(coreset.04, 3, nstart = 25)
+km.c.05<- kmeans(coreset.05, 3, nstart = 25)
+km.c.1<- kmeans(coreset.1, 3, nstart = 25)
+km.c.25<- kmeans(coreset.25, 3, nstart = 25)
+
+test.preds.04 <- predict.kmeans(km.c.04, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.05 <- predict.kmeans(km.c.05, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.1 <- predict.kmeans(km.c.1, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.25 <- predict.kmeans(km.c.25, test.iris[,c("Petal.Length","Petal.Width")])
+
+test.preds.04 <- relabel.clusters(km.c.04,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.04)
+test.preds.05 <- relabel.clusters(km.c.05,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.05)
+test.preds.1 <- relabel.clusters(km.c.1,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.1)
+test.preds.25 <- relabel.clusters(km.c.25,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.25)
+
+test.acc.04<- sum(test.preds.04$preds==test.iris$Species)/nrow(test.iris)
+test.acc.05<- sum(test.preds.05$preds==test.iris$Species)/nrow(test.iris)
+test.acc.1<- sum(test.preds.1$preds==test.iris$Species)/nrow(test.iris)
+test.acc.25<- sum(test.preds.25$preds==test.iris$Species)/nrow(test.iris)
+
+test.acc <- c("--", test.acc.04, test.acc.05, test.acc.1, test.acc.25)
+
+totwss.04 <- kmeans.tot.withinss(km.c.04,iris[,3:4])
+totwss.05 <- kmeans.tot.withinss(km.c.05,iris[,3:4])
+totwss.1 <- kmeans.tot.withinss(km.c.1,iris[,3:4])
+totwss.25 <- kmeans.tot.withinss(km.c.25,iris[,3:4])
+
+totwss <- c("--", totwss.04, totwss.05, totwss.1, totwss.25)
+
+iris.sweep <- data.frame(coreset.size = sizes, test.accuracy = test.acc, tot.w.ss = totwss)
+iris.sweep <- rbind(iris.sweep, c("full", acc.test, ss[1]))
+```
+
+```{r, echo=FALSE}
+iris.sweep %>% 
+    kbl(caption="Iris Dataset Metrics") %>%
+    kable_paper(full_width = F)%>%
+    kable_styling(latex_options="HOLD_position")
+```
+
+```{r simulated-coreset-size-sweep, echo=FALSE}
+py_set_seed(seed, disable_hash_randomization = TRUE)
+coreset.01.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.01)))[[1]])
+coreset.04.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.04)))[[1]])
+coreset.05.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.05)))[[1]])
+coreset.1.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.1)))[[1]])
+coreset.25.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.25)))[[1]])
+
+set.seed(seed)
+km.c.01.sim <- kmeans(coreset.01.sim, 4, nstart = 25)
+km.c.04.sim <- kmeans(coreset.04.sim, 4, nstart = 25)
+km.c.05.sim <- kmeans(coreset.05.sim, 4, nstart = 25)
+km.c.1.sim <- kmeans(coreset.1.sim, 4, nstart = 25)
+km.c.25.sim <- kmeans(coreset.25.sim, 4, nstart = 25)
+
+test.preds.01.sim <- predict.kmeans(km.c.01.sim, test.sim[,-6])
+test.preds.04.sim <- predict.kmeans(km.c.04.sim, test.sim[,-6])
+test.preds.05.sim <- predict.kmeans(km.c.05.sim, test.sim[,-6])
+test.preds.1.sim <- predict.kmeans(km.c.1.sim, test.sim[,-6])
+test.preds.25.sim <- predict.kmeans(km.c.25.sim, test.sim[,-6])
+
+test.preds.01.sim <- relabel.clusters(km.c.01.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.01.sim)
+test.preds.04.sim <- relabel.clusters(km.c.04.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.04.sim)
+test.preds.05.sim <- relabel.clusters(km.c.05.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.05.sim)
+test.preds.1.sim <- relabel.clusters(km.c.1.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.1.sim)
+test.preds.25.sim <- relabel.clusters(km.c.25.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.25.sim)
+
+test.acc.01.sim <- sum(test.preds.01.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.04.sim <- sum(test.preds.04.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.05.sim <- sum(test.preds.05.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.1.sim <- sum(test.preds.1.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.25.sim <- sum(test.preds.25.sim$preds==test.sim[,6])/nrow(test.sim)
+
+test.acc <- c(test.acc.01.sim, 
+              test.acc.04.sim, 
+              test.acc.05.sim, 
+              test.acc.1.sim, 
+              test.acc.25.sim)
+
+totwss.01.sim <- kmeans.tot.withinss(km.c.01.sim,sim.data[,-6])
+totwss.04.sim <- kmeans.tot.withinss(km.c.04.sim,sim.data[,-6])
+totwss.05.sim <- kmeans.tot.withinss(km.c.05.sim,sim.data[,-6])
+totwss.1.sim <- kmeans.tot.withinss(km.c.1.sim,sim.data[,-6])
+totwss.25.sim <- kmeans.tot.withinss(km.c.25.sim,sim.data[,-6])
+
+totwss <- c(totwss.01.sim, totwss.04.sim, totwss.05.sim, totwss.1.sim, totwss.25.sim)
+
+sim.sweep <- data.frame(coreset.size = sizes, test.accuracy = test.acc, tot.w.ss = totwss)
+sim.sweep <- rbind(sim.sweep, c("full", acc.test.sim, ss.sim[1]))
+```
+
+There are some interesting results here. The Iris dataset achieves the best performance using a 25% coreset, even better than with the full dataset. The Iris results indicate that the pseudo-random seeds, which come into play both in the coreset generation and the $k$-means fit, have an impact on the results. This is clear because the results from the 10% coreset are slightly lower than those reported earlier in this paper. However, one trend that seems to exist is that there is a significant drop in performance in the coresets smaller than 10%. Still, when we consider that the 4% and 5% coresets are made up of four and five data observations, respectively, the results really are not as atrocious as we might expect.  
+
+```{r, echo=FALSE}
+sim.sweep %>% 
+    kbl(caption="Simulated Dataset Metrics") %>%
+    kable_paper(full_width = F)%>%
+    kable_styling(latex_options="HOLD_position")
+```
+
+For this larger simulated dataset, we see that the accuracy is extremely close for all coreset sizes. The 5% coreset achieves the highest accuracy, but it is not by very much and, again, this could be attributed to the pseudo-random seed. Additionally, the 1% coreset achieves slightly higher accuracy than the full dataset. The total within-cluster sum of squares  is strictly decreasing as we increase the dataset size, however. Overall, it is pretty interesting to note how consistent the accuracy remains, even with coresets as small as 1% of the original dataset. 
+
+# Conclusion
+
+We have demonstrated how powerful coresets can be to solve $k$-means problems. And still, this only begins to scratch the surface of the applications of coresets. Our results showed that constructing coresets of large datasets can provide extremely reliable results. The results on the smaller dataset showed a greater drop in accuracy with small coreset sizes. However, our results indicate that coresets still have use for small datasets- one may simply choose to construct a coreset that is a little bit larger in proportion to the full dataset. 
+
+# Appendix 
+
+## Code
+
+The code used for this project can be found at <>. 
+
+\newpage
+# Bibliography

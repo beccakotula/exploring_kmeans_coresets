@@ -1,0 +1,524 @@
+---
+title: "Data Mining- Project Working Code"
+author: "Rebecca Kotula"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Libraries
+```{r, include=FALSE}
+library(ggplot2)
+library(MASS) 
+library(Rtsne)
+library(caret)
+library(GGally)
+library(reticulate)
+library(plyr)
+library(tidyverse)
+library(Rfast)
+use_virtualenv("/Users/rebeccakotula/Documents/jhu/datamining/dm")
+np <- import("numpy")
+coresets <- import("coresets")
+
+seed <- 1234
+```
+
+
+# Helper Functions
+```{r}
+### K-means helper functions 
+predict.kmeans <- function(km.object, newdata){
+    centers <- km.object$centers
+    n.centers <- nrow(centers)
+    dist.mat <- as.matrix(dist(rbind(centers, newdata)))
+    dist.mat <- dist.mat[-seq(n.centers), seq(n.centers)]
+    max.col(-dist.mat)
+}
+
+euclidean.dist <- function(a, b){
+    sqrt(sum((a - b)^2))
+}
+
+kmeans.tot.withinss <- function(km.object, data){
+    centers <- km.object$centers
+    dist.mat <- data.frame(matrix(NA, nrow = nrow(data), ncol = nrow(centers)))
+    for (i in 1:nrow(centers)){
+        dist.mat[,i] <- apply(data, 1, function(x) euclidean.dist(x,centers[i,])) 
+    }
+    dists <- apply(dist.mat, 1, function(x) min(x))
+    sum(dists^2)
+}
+
+relabel.clusters <- function(km.object, data.x, data.y, preds){
+    centers <- km.object$centers
+    n.centers <- nrow(centers)
+    dist.mat <- as.matrix(dist(rbind(centers, data.x)))
+    dist.mat <- dist.mat[-seq(n.centers), seq(n.centers)]
+    min.idxs <- as.integer(colMins(dist.mat)) #rownames(dist.mat)[colMins(dist.mat)]
+    clusts <- seq(1, n.centers, by=1)
+    labels <- data.y[min.idxs]
+    
+    preds <- as.data.frame(preds)
+    for (i in 1:n.centers){
+        preds <- data.frame(preds)
+        preds[preds$preds==i,] <- paste0(labels[i])
+    }
+    return(preds)
+}
+```
+
+# Iris Dataset
+## Data Preparation
+```{r}
+data(iris)
+train.size <- floor(0.75 * nrow(iris))
+set.seed(seed)
+train.ind <- sample(seq_len(nrow(iris)), size = train.size)
+
+train.iris <- iris[train.ind, ]
+test.iris <- iris[-train.ind, ]
+```
+
+
+```{r}
+g <- ggplot(train.iris, aes(x=Petal.Length, y = Petal.Width, col=Species)) + 
+    geom_point() + 
+    theme_minimal() +
+    ggtitle("Iris Training Dataset with True Class Labels")
+g
+```
+
+Results of K-means clustering with 3 clusters on Iris dataset (petal length and petal width features only)
+
+
+## K-Means Clustering
+```{r}
+set.seed(seed)
+km <- kmeans(train.iris[,c("Petal.Length", "Petal.Width")], 3, nstart = 25)
+
+preds <- km$cluster
+preds <- relabel.clusters(km, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          preds)
+
+k <- ggplot(cbind(train.iris, preds), aes(x=Petal.Length, y = Petal.Width, col=preds)) + 
+    geom_point()+ 
+    theme_minimal() + 
+    ggtitle("Iris Training Dataset with K-Means Predicted Class Labels") +
+    labs(color='Predicted Species') 
+k
+```
+
+```{r iris-train-accuracy}
+# Training Accuracy
+acc <- sum(preds==train.iris$Species)/nrow(train.iris)
+acc
+```
+
+## Coreset Construction
+```{r}
+py_set_seed(seed, disable_hash_randomization = TRUE)
+X <- as.matrix(train.iris[,c("Petal.Length", "Petal.Width")])
+cs <- coresets$KMeansCoreset(X)
+coreset_gen <- cs$generate_coreset(as.integer(nrow(X)*0.1))
+
+train.iris.coreset <- data.frame(coreset_gen[[1]])
+train.iris.coreset["weights"] <- coreset_gen[[2]]
+colnames(train.iris.coreset) <- c("Petal.Length", "Petal.Width","weights")
+
+print(nrow(train.iris.coreset))
+```
+
+```{r iris-coreset-plot}
+c <- ggplot() + geom_point(data=train.iris, aes(x=Petal.Length, y = Petal.Width)) + 
+    geom_point(data=train.iris.coreset, aes(x=Petal.Length,y=Petal.Width, size=weights), alpha=0.6,col='red')+ 
+    theme_minimal() + 
+    ggtitle("Iris Training Dataset with Coreset in Red")
+c
+```
+
+## K-Means on Coreset
+```{r iris-coreset-kmeans}
+set.seed(seed)
+km.c <- kmeans(train.iris.coreset[,1:2], 3, nstart = 25)
+preds.c <- km.c$cluster
+preds.c <- relabel.clusters(km.c, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          preds.c)
+
+train.iris.coreset["Species.Pred"] <- preds.c
+
+k.c <- ggplot(train.iris.coreset, aes(col=Species.Pred)) +
+    geom_point(aes(x=Petal.Length,y=Petal.Width))+ 
+    theme_minimal() + 
+    ggtitle("Coreset with K-means Predicted Species")
+k.c
+```
+
+```{r kmeans-iris-centers}
+c <- ggplot() + geom_point(data=iris, aes(x=Petal.Length, y = Petal.Width, col=Species)) + 
+    geom_point(aes(x=km$centers[,1],y=km$centers[,2]), col='blue', shape=15, size=3)+
+    geom_point(aes(x=km.c$centers[,1],y=km.c$centers[,2]), col='red', shape=15, size=3)+ 
+    theme_minimal() +
+    ggtitle("K-means Centers on Full Iris Dataset") 
+c
+```
+
+
+## Results
+
+### Accuracy and Confusion Matrix 
+
+```{r iris-test-accuracy}
+set.seed(seed)
+test.preds <- predict.kmeans(km, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds <- relabel.clusters(km, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          test.preds)
+
+table(test.preds$preds, test.iris$Species)
+```
+
+```{r}
+acc.test <- sum(test.preds$preds==test.iris$Species)/nrow(test.iris)
+acc.test
+```
+
+```{r iris-coreset-test-accuracy}
+set.seed(seed)
+test.preds.c <- predict.kmeans(km.c, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.c <- relabel.clusters(km.c, 
+                          iris[,c("Petal.Length", "Petal.Width")], 
+                          iris[,"Species"], 
+                          test.preds.c)
+
+table(test.preds.c$preds, test.iris$Species)
+```
+```{r}
+acc.test.c <- sum(test.preds.c$preds==test.iris$Species)/nrow(test.iris)
+acc.test.c
+```
+
+### tot.withinss
+```{r iris-withinss}
+kmeans.tot.withinss(km,iris[,3:4])
+```
+
+```{r iris-coreset-withinss}
+kmeans.tot.withinss(km.c,iris[,3:4])
+```
+
+
+## Coreset Size Sweep
+
+```{r}
+sizes <- c(0.01,0.04, 0.05, 0.1, 0.25)
+py_set_seed(seed, disable_hash_randomization = TRUE)
+coreset.04 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.04)))[[1]])
+coreset.05 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.05)))[[1]])
+coreset.1 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.1)))[[1]])
+coreset.25 <- data.frame((cs$generate_coreset(as.integer(nrow(X)*0.25)))[[1]])
+
+colnames(coreset.04) <- c("Petal.Length", "Petal.Width")
+colnames(coreset.05) <- c("Petal.Length", "Petal.Width")
+colnames(coreset.1) <- c("Petal.Length", "Petal.Width")
+colnames(coreset.25) <- c("Petal.Length", "Petal.Width")
+
+set.seed(seed)
+km.c.04<- kmeans(coreset.04, 3, nstart = 25)
+km.c.05<- kmeans(coreset.05, 3, nstart = 25)
+km.c.1<- kmeans(coreset.1, 3, nstart = 25)
+km.c.25<- kmeans(coreset.25, 3, nstart = 25)
+
+test.preds.04 <- predict.kmeans(km.c.04, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.05 <- predict.kmeans(km.c.05, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.1 <- predict.kmeans(km.c.1, test.iris[,c("Petal.Length","Petal.Width")])
+test.preds.25 <- predict.kmeans(km.c.25, test.iris[,c("Petal.Length","Petal.Width")])
+
+test.preds.04 <- relabel.clusters(km.c.04,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.04)
+test.preds.05 <- relabel.clusters(km.c.05,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.05)
+test.preds.1 <- relabel.clusters(km.c.1,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.1)
+test.preds.25 <- relabel.clusters(km.c.25,
+                               iris[,c("Petal.Length", "Petal.Width")],
+                               iris[,"Species"],
+                               test.preds.25)
+
+test.acc.04<- sum(test.preds.04$preds==test.iris$Species)/nrow(test.iris)
+test.acc.05<- sum(test.preds.05$preds==test.iris$Species)/nrow(test.iris)
+test.acc.1<- sum(test.preds.1$preds==test.iris$Species)/nrow(test.iris)
+test.acc.25<- sum(test.preds.25$preds==test.iris$Species)/nrow(test.iris)
+
+test.acc <- c("--", test.acc.04, test.acc.05, test.acc.1, test.acc.25)
+
+totwss.04 <- kmeans.tot.withinss(km.c.04,train.iris[,3:4])
+totwss.05 <- kmeans.tot.withinss(km.c.05,train.iris[,3:4])
+totwss.1 <- kmeans.tot.withinss(km.c.1,train.iris[,3:4])
+totwss.25 <- kmeans.tot.withinss(km.c.25,train.iris[,3:4])
+
+totwss <- c("--", totwss.04, totwss.05, totwss.1, totwss.25)
+
+iris.sweep <- data.frame(coreset.size = sizes, test.accuracy = test.acc, tot.w.ss = totwss)
+```
+
+
+# Simulated Data
+
+## Data Preparation 
+
+```{r}
+# set seed and create data vectors 
+set.seed(seed) 
+sample.size <- 4000                                        
+class1.mu <- c(10, 5, 7, 9, 20)   
+class2.mu <- c(9, 3, 4, 5, 15)   
+class3.mu <- c(3, 2, 1, 4, 9)   
+class4.mu <- c(5, 5, 5, 5, 5)   
+
+n <- 5  
+A1 <- matrix(runif(n^2)*2-1, ncol=n) 
+sigma1 <- t(A1) %*% A1
+
+A2 <- matrix(runif(n^2)*4-2, ncol=n) 
+sigma2 <- t(A2) %*% A2
+
+A3 <- matrix(runif(n^2)*3-2, ncol=n) 
+sigma3 <- t(A3) %*% A3
+
+A4 <- matrix(runif(n^2)*2-2, ncol=n) 
+sigma4 <- t(A4) %*% A4
+  
+# create multivariate normal distribution 
+class1.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class1.mu,  
+                               Sigma = sigma1))
+class2.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class2.mu,  
+                               Sigma = sigma2)) 
+class3.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class3.mu,  
+                               Sigma = sigma3))
+class4.dat <- data.frame(mvrnorm(n = sample.size, 
+                               mu = class4.mu,  
+                               Sigma = sigma4))
+
+class1.dat$class <- "a"
+class2.dat$class <- "b"
+class3.dat$class <- "c"
+class4.dat$class <- "d"
+
+sim.data <- rbind(class1.dat,rbind(class2.dat,rbind(class3.dat, class4.dat)))
+
+sim.mat <- as.matrix(sim.data[,-6]) 
+
+sim.sd <- apply(sim.mat, 1, sd)
+sim.dat <- sim.mat + rnorm(length(sim.mat), mean = 0, sd = sim.sd * 0.05)
+sim.data[,1:5] <- sim.dat
+```
+
+
+```{r}
+train.size.sim <- floor(0.75 * nrow(sim.data))
+set.seed(seed)
+train.ind.sim <- sample(seq_len(nrow(sim.data)), size = train.size.sim)
+
+train.sim <- sim.data[train.ind.sim, ]
+test.sim <- sim.data[-train.ind.sim, ]
+print(nrow(train.sim))
+print(nrow(test.sim))
+```
+
+
+
+```{r}
+set.seed(seed)
+train.sim.mat <- as.matrix(train.sim[,-6])
+tsne.sim.out <- Rtsne(train.sim.mat, check_duplicates = FALSE)
+```
+
+```{r}
+tsne.sim.plot <- data.frame(x = tsne.sim.out$Y[,1],
+                        y = tsne.sim.out$Y[,2])
+g.sim.tsne <- ggplot(tsne.sim.plot) +
+    geom_point(aes(x=x, y=y, col = as.factor(train.sim[,6]))) +
+    theme_minimal() +
+    labs(color='class') +
+    ggtitle("t-SNE Representation of Simulated Training Dataset")
+g.sim.tsne
+```
+
+## K-Means Clustering
+```{r}
+set.seed(seed)
+km.sim<- kmeans(train.sim[,-6], 4, nstart = 25)
+
+preds.sim <- km.sim$cluster
+preds.sim <- relabel.clusters(km.sim, train.sim[,-6], train.sim[,6], preds.sim)
+
+sim.tsne.pred <- ggplot(cbind(tsne.sim.plot, preds.sim)) +
+    geom_point(aes(x=x, y=y, col = preds)) +
+    theme_minimal() +
+    labs(color='class') +
+    ggtitle("t-SNE Representation of Simulated Training Dataset K-Means Predictions")
+sim.tsne.pred
+```
+
+```{r sim-training-accuracy}
+acc.sim <- sum(preds.sim$preds==train.sim[,6])/nrow(train.sim)
+acc.sim
+```
+
+
+```{r}
+table(as.factor(preds.sim$preds), as.factor(train.sim[,6]))
+```
+## Test Accuracy 
+```{r}
+set.seed(seed)
+test.sim.preds <- predict.kmeans(km.sim, test.sim[,-6])
+test.sim.preds <- relabel.clusters(km.sim, 
+                                   train.sim[,-6], 
+                                   train.sim[,6], 
+                                   test.sim.preds)
+
+table(test.sim.preds$preds, test.sim[,6])
+```
+
+```{r}
+acc.test.sim <- sum(test.sim.preds$preds==test.sim[,6])/nrow(test.sim)
+acc.test.sim
+```
+
+## Coreset Construction
+
+```{r sim-coreset}
+# Generate Coreset
+py_set_seed(seed, disable_hash_randomization = TRUE)
+X.sim <- as.matrix(train.sim[,-6])
+cs.sim <- coresets$KMeansCoreset(X.sim, n_clusters = as.integer(4), random_state = as.integer(1234))
+coreset_gen.sim <- cs.sim$generate_coreset(as.integer(length(X.sim)*0.01))
+
+train.sim.coreset <- data.frame(coreset_gen.sim[[1]])
+print(nrow(train.sim.coreset))
+
+# Which indices from original dataset are in the coreset: 
+train.sim.list <- paste(train.sim[,1], train.sim[,2], train.sim[,3], train.sim[,4], train.sim[,5])
+train.sim.coreset.list <- paste(train.sim.coreset[,1], train.sim.coreset[,2], train.sim.coreset[,3], train.sim.coreset[,4], train.sim.coreset[,5])
+coreset.ind <- which(train.sim.list %in% train.sim.coreset.list)
+```
+
+```{r}
+c.sim <- ggplot() + 
+    geom_point(data=tsne.sim.plot, aes(x=x, y=y), alpha=0.6) + 
+    geom_point(data=coreset.plot, aes(x=x,y=y),  col='red')+ 
+    theme_minimal() + 
+    ggtitle("Simulated Training Dataset with 1% Coreset in Red")
+c.sim
+```
+
+
+## K-Means on Coreset
+
+```{r}
+set.seed(seed)
+km.c.sim <- kmeans(train.sim.coreset, 4, nstart = 25)
+preds.c.sim <- km.c.sim$cluster
+preds.c.sim <- relabel.clusters(km.c.sim, 
+                                train.sim[,-6], 
+                                train.sim[,6], 
+                                preds.c.sim)
+
+k.c.sim <- ggplot(cbind(tsne.sim.plot[coreset.ind,], preds.c.sim)) +
+    geom_point(aes(x=x,y=y, col=preds))+ 
+    theme_minimal() + 
+    ggtitle("Coreset with K-means Predicted Class")
+k.c.sim
+```
+
+```{r}
+c.sim <- ggplot() + #geom_point(data=tsne.sim.plot, aes(x=x, y = y, col=as.factor(train.sim[,6]))) + 
+    geom_point(aes(x=km.sim$centers[,1],y=km.sim$centers[,2]), col='blue', shape=15, size=3)+
+    geom_point(aes(x=km.c.sim$centers[,1],y=km.c.sim$centers[,2]), col='red', shape=15, size=3)+ 
+    theme_minimal() +
+    ggtitle("K-means Centers on Simulated Training Dataset") 
+c.sim
+```
+
+
+## Coreset Size Sweep
+
+```{r simulated-coreset-size-sweep}
+py_set_seed(seed, disable_hash_randomization = TRUE)
+coreset.01.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.01)))[[1]])
+coreset.04.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.04)))[[1]])
+coreset.05.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.05)))[[1]])
+coreset.1.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.1)))[[1]])
+coreset.25.sim <- data.frame((cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.25)))[[1]])
+
+set.seed(seed)
+km.c.01.sim <- kmeans(coreset.01.sim, 4, nstart = 25)
+km.c.04.sim <- kmeans(coreset.04.sim, 4, nstart = 25)
+km.c.05.sim <- kmeans(coreset.05.sim, 4, nstart = 25)
+km.c.1.sim <- kmeans(coreset.1.sim, 4, nstart = 25)
+km.c.25.sim <- kmeans(coreset.25.sim, 4, nstart = 25)
+
+test.preds.01.sim <- predict.kmeans(km.c.01.sim, test.sim[,-6])
+test.preds.04.sim <- predict.kmeans(km.c.04.sim, test.sim[,-6])
+test.preds.05.sim <- predict.kmeans(km.c.05.sim, test.sim[,-6])
+test.preds.1.sim <- predict.kmeans(km.c.1.sim, test.sim[,-6])
+test.preds.25.sim <- predict.kmeans(km.c.25.sim, test.sim[,-6])
+
+test.preds.01.sim <- relabel.clusters(km.c.01.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.01.sim)
+test.preds.04.sim <- relabel.clusters(km.c.04.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.04.sim)
+test.preds.05.sim <- relabel.clusters(km.c.05.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.05.sim)
+test.preds.1.sim <- relabel.clusters(km.c.1.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.1.sim)
+test.preds.25.sim <- relabel.clusters(km.c.25.sim,
+                                test.sim[,-6],
+                                test.sim[,6],
+                               test.preds.25.sim)
+
+test.acc.01.sim <- sum(test.preds.01.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.04.sim <- sum(test.preds.04.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.05.sim <- sum(test.preds.05.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.1.sim <- sum(test.preds.1.sim$preds==test.sim[,6])/nrow(test.sim)
+test.acc.25.sim <- sum(test.preds.25.sim$preds==test.sim[,6])/nrow(test.sim)
+
+test.acc <- c(test.acc.01.sim, 
+              test.acc.04.sim, 
+              test.acc.05.sim, 
+              test.acc.1.sim, 
+              test.acc.25.sim)
+
+totwss.01.sim <- kmeans.tot.withinss(km.c.01.sim,sim.data[,-6])
+totwss.04.sim <- kmeans.tot.withinss(km.c.04.sim,sim.data[,-6])
+totwss.05.sim <- kmeans.tot.withinss(km.c.05.sim,sim.data[,-6])
+totwss.1.sim <- kmeans.tot.withinss(km.c.1.sim,sim.data[,-6])
+totwss.25.sim <- kmeans.tot.withinss(km.c.25.sim,sim.data[,-6])
+
+totwss <- c(totwss.01.sim, totwss.04.sim, totwss.05.sim, totwss.1.sim, totwss.25.sim)
+
+sim.sweep <- data.frame(coreset.size = sizes, test.accuracy = test.acc, tot.w.ss = totwss)
+```
