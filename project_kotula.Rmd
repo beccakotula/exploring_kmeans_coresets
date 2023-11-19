@@ -692,7 +692,7 @@ We have demonstrated how powerful coresets can be to solve $k$-means problems. A
 
 ## Code
 
-The code used for this project can be found at <>. 
+The code used for this project can be found at <https://github.com/beccakotula/exploring_kmeans_coresets>. 
 
 \newpage
 # Bibliography
