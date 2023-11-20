@@ -1,6 +1,6 @@
 ---
 title: |
-  <center> Exploring the Power of Coresets for K-Means Clustering</center>
+  <center> Exploring the Power of Coresets for $k$-Means Clustering</center>
 subtitle: |
     | Johns Hopkins University  
     | EN.625.740 Data Mining
@@ -111,7 +111,7 @@ $$cost(\mathcal{X}, Q) = \sum_{x\in \mathcal{X}} \mu_{\mathcal{X}}(x)f_{Q}(x) = 
 where $f_{Q}(x) =\min_{q\in Q} \lVert x-q\rVert_2^2$ is the squared distance from each point $x\in \mathcal{X}$ to the closest cluster center in $Q$. 
 
 Now, with $\epsilon> 0$, we can formally define a coreset as an $\epsilon-coreset$ of $\mathcal{X}$ if for all $Q\in\mathcal{Q}$:
-$$\lvert cost(\mathcal{X}, Q) - cost(\mathcal{C}, Q)\rvert \leq \epsilon cost(\mathcal{X}, Q)$$
+$$\lvert cost(\mathcal{X}, Q) - cost(\mathcal{C}, Q)\rvert \leq \epsilon*cost(\mathcal{X}, Q)$$
 If this holds for all possible solutions $Q\subset \mathcal{Q}$, then $\mathcal{C}$ is a *strong coreset*. If it only holds for the optimal solution, then it is a *weak coreset*. 
 
 There are many approaches to constructing a coreset. There are naive approaches, such as uniform sampling, but methods such using importance sampling achieve greater results with smaller coresets. In importance sampling, points are sampled proportionate to their impact on the cost of any given candidate solution. Points are weighted accordingly, and points with low optimum cost are sampled uniformly. Related to importance sampling is sensivity-based sampling. The sensitivity for a point is defined as
@@ -192,7 +192,7 @@ sim.dat <- sim.mat + rnorm(length(sim.mat), mean = 0, sd = sim.sd * 0.05)
 sim.data[,1:5] <- sim.dat
 ```
 
-There are `r nrow(sim.data)` in this dataset and the class distribution is: 
+There are `r nrow(sim.data)` observations in this dataset and the class distribution is: 
 
 ```{r dist-sim-data, echo=FALSE}
 table(sim.data$c) %>% 
@@ -300,7 +300,7 @@ The weights here correspond to the importance of each point in the coreset. This
 py_set_seed(seed, disable_hash_randomization = TRUE)
 X.sim <- as.matrix(train.sim[,-6])
 cs.sim <- coresets$KMeansCoreset(X.sim, n_clusters = as.integer(4), random_state = as.integer(1234))
-coreset_gen.sim <- cs.sim$generate_coreset(as.integer(length(X.sim)*0.01))
+coreset_gen.sim <- cs.sim$generate_coreset(as.integer(nrow(X.sim)*0.01))
 
 train.sim.coreset <- data.frame(coreset_gen.sim[[1]])
 train.sim.coreset.weights <- coreset_gen.sim[[2]]
@@ -514,7 +514,7 @@ data.frame(train.set =train.set.sim, test.accuracy = acc.sim, tot.within.ss = ss
     kable_styling(latex_options="HOLD_position")
 ```
 
-The clustering accuracy is not quite as good on this dataset as what we achieved on the Iris dataset, but we achieve nearly equivalent accuracy using only 1% of the original testing set. The total within-cluster sum of squares is still quite close as well. Now let us look more closely at the confusion matrices. 
+The overall clustering accuracy slightly worse on this dataset as what we achieved on the Iris dataset. But a 1% of the original testing set actually *improves* the accuracy from that of the original dataset. It is quite minimal, but it is still an improvelent. The total within-cluster sum of squares is still quite close as well, but this is actually slightly higher. Now let us look more closely at the confusion matrices. 
 
 ```{r, echo=FALSE,results="asis"}
 t1 <- kable(table(test.sim.preds$preds, test.sim[,6]), format="latex", booktabs=TRUE)
